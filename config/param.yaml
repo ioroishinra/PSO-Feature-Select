@@ -1,0 +1,21 @@
+# model
+model_type: lr
+
+# dataset
+dataset_name: null
+dataset_file_path: data/data.csv
+dim: 50
+k_fold: 10
+shuffle: true
+
+# algorithm
+random_seed: 42
+eval_type: mse
+eval_model_type: lr
+num_particles: 100
+num_iterations: 50
+topology_type: von_neumann
+k: 5
+c1: 2.0
+c2: 2.0
+w: 0.6
