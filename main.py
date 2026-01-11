@@ -1,3 +1,4 @@
+import os
 import math
 import yaml
 import random
@@ -8,11 +9,26 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from tqdm import trange
+from contextlib import contextmanager
 from datetime import datetime
 from sklearn.linear_model import LinearRegression
 from sklearn.svm import SVR
 
 logger = logging.getLogger("PSO")
+
+@contextmanager
+def no_handler(logger, handler_name):
+    handlers = [
+        h for h in logger.handlers
+        if getattr(h, "name", None) == handler_name
+    ]
+    for h in handlers:
+        logger.removeHandler(h)
+    try:
+        yield
+    finally:
+        for h in handlers:
+            logger.addHandler(h)
 
 def k_fold_split(x: pd.DataFrame, y: pd.Series, k: int, shuffle=True, random_seed=None):
     n = len(x)
@@ -46,7 +62,7 @@ def grid_shape(n):
             return r, n // r
     return 1, n
 
-def model_generator(model_type):
+def generate_model(model_type):
     if model_type == "lr":
         return LinearRegression()
     if model_type == "svr":
@@ -54,13 +70,13 @@ def model_generator(model_type):
     else:
         raise NotImplementedError
 
-def function_generator(eval_type, model_type):
+def generate_function(eval_type, model_type, alpha=0.05, dim=None):
     def predict(x, y):
-        model = model_generator(model_type)
+        model = generate_model(model_type)
         model.fit(x, y)
         return model.predict(x)
     if eval_type == "mse":
-        return lambda x, y: np.mean((y - predict(x, y)) ** 2)
+        return lambda x, y: np.mean((y - predict(x, y)) ** 2) * (1 + alpha * (x.shape[1] / dim)) if x.shape[1] != 0 else 1e6
     else:
         raise NotImplementedError
 
@@ -84,14 +100,25 @@ def get_neighbourhood(topology_type, particles, idx, k):
     else:
         raise NotImplementedError
 
+def init_particles_uniform_k(num_particles, dim):
+    particles = np.zeros((num_particles, dim), dtype=int)
+    k_min = int(0.2 * dim)
+    k_max = int(0.8 * dim)
+    for i in range(num_particles):
+        k = np.random.randint(k_min, k_max + 1)
+        idx = np.random.choice(dim, size=k, replace=False)
+        particles[i, idx] = 1
+    return pd.DataFrame(particles)
+
 def pso(x, y, info):
     best_scores = []
 
     # fitness function definition
-    func = function_generator(info["eval_type"], info["eval_model_type"])
+    func = generate_function(info["eval_type"], info["eval_model_type"], info["alpha"], info["dim"])
 
     # initialization
-    particles = pd.DataFrame(np.random.randint(0, 2, (info["num_particles"], info["dim"])))
+    particles = init_particles_uniform_k(info["num_particles"], info["dim"])
+    # particles = pd.DataFrame(np.random.randint(0, 2, (info["num_particles"], info["dim"])))
     scores = pd.DataFrame(np.zeros((info["num_particles"])))
     for i in range(info["num_particles"]):
         scores.iloc[i] = func(x.iloc[:, (particles.iloc[i] == 1).values], y)
@@ -103,10 +130,25 @@ def pso(x, y, info):
     global_best_score = scores_best.iloc[global_best_idx].copy()
 
     # PSO optimization
-    for _ in trange(info["num_iterations"], desc="PSO optimization: ", unit="Iters", leave=False):
+    for i in trange(info["num_iterations"], desc="PSO optimization", unit="Iters", leave=False):
 
         # position update
         particles = (particles + velocities).clip(0,1).round().astype(int)
+
+        # randomly rebooting
+        if i % 40 == 0:
+            reboot_ratio = info.get("reboot_ratio", 0.2)
+            vel_eps = info.get("vel_eps", 1e-8)
+            num_reboot = max(1, int(info["num_particles"] * reboot_ratio))
+            reboot_idx = np.random.choice(info["num_particles"], size=num_reboot, replace=False)
+            reboot_num = 0
+            for j in reboot_idx:
+                if np.sum(velocities.iloc[j].values ** 2) < vel_eps:
+                    particles.iloc[j] = np.random.randint(0, 2, info["dim"])
+                    velocities.iloc[j] = np.random.uniform(-1, 1, info["dim"])
+                    reboot_num += 1
+            with no_handler(logger, "console"):
+                logger.debug(f"In iteration {i}, {reboot_num} particles rebooted.")
 
         # fitness scores update
         for i in range(info["num_particles"]):
@@ -168,12 +210,11 @@ def main(info):
         result = ""
         for feature in global_best.values:
             result += str(feature)
-        logger.info(result)
         logger.info(f"Fold {fold+1} Global best: {sum(global_best.values)} features, {result}")
 
     # model creation
-        model = model_generator(info["model_type"])
-        model_pso = model_generator(info["model_type"])
+        model = generate_model(info["model_type"])
+        model_pso = generate_model(info["model_type"])
 
     # model training
         model.fit(x_tr, y_tr)
@@ -182,12 +223,10 @@ def main(info):
     # model evaluation
         score = np.mean((y_val - model.predict(x_val)) ** 2)
         cv_scores.append(score)
-        logger.info(f"ORI Score: {score}")
         score_pso = np.mean((y_val - model_pso.predict(x_val_pso)) ** 2)
         cv_scores_pso.append(score_pso)
-        logger.info(f"PSO Score: {score_pso}")
-    logger.info(f"ORI Mean Score: {np.mean(cv_scores)}")
-    logger.info(f"PSO Mean Score: {np.mean(cv_scores_pso)}")
+        logger.info(f"ORI Score: {score}, PSO Score: {score_pso}. Difference: {score_pso - score}.")
+    logger.info(f"ORI Mean Score: {np.mean(cv_scores)}, PSO Mean Score: {np.mean(cv_scores_pso)}. Difference: {np.mean(cv_scores_pso) - np.mean(cv_scores)}.")
 
     # visualization
     plt.figure(figsize=(8, 5))
@@ -198,21 +237,25 @@ def main(info):
     plt.title("PSO Global Best Score over Iterations (k-fold CV)")
     plt.legend()
     plt.grid(True)
-    plt.show()
+    plt.savefig(f"{info["result_dir"]}/convergence_curve.png")
 
 if __name__ == '__main__':
     # logger configuration
     with open("config/logging.yaml", "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    config["handlers"]["file"]["filename"] = f"logs/exp_{timestamp}.log"
+    result_dir = f"./results/{timestamp}"
+    os.mkdir(result_dir)
+    config["handlers"]["backup"]["filename"] = f"logs/{timestamp}.log"
+    config["handlers"]["file"]["filename"] = f"{result_dir}/{timestamp}.log"
     logging.config.dictConfig(config)
 
     # parameters loading
     with open("config/param.yaml", "r", encoding="utf-8") as f:
         info = yaml.safe_load(f)
-    logger.info("=== Experiment parameters ===")
-    for key, value in info.items():
-        logger.info(f"{key:<20} | {value}")
+    with open(f"{result_dir}/config.yaml", "w", encoding="utf-8") as f:
+        yaml.dump(info, f)
+    logger.info(f"Configure backup saved as {result_dir}/config.yaml.")
+    info["result_dir"] = result_dir
 
     main(info)
