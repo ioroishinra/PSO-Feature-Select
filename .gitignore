@@ -209,6 +209,8 @@ __marimo__/
 # logs
 logs/
 
-# idea
-.idea/
+# results
 results/
+
+# configs
+config/param.yaml

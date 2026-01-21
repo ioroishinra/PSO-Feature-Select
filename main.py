@@ -76,7 +76,8 @@ def generate_function(eval_type, model_type, alpha=0.05, dim=None):
         model.fit(x, y)
         return model.predict(x)
     if eval_type == "mse":
-        return lambda x, y: np.mean((y - predict(x, y)) ** 2) * (1 + alpha * (x.shape[1] / dim)) if x.shape[1] != 0 else 1e6
+        return lambda x, y: np.mean((y - predict(x, y)) ** 2) * (1 + alpha * (x.shape[1] / dim)) \
+            if x.shape[1] != 0 else 1e6
     else:
         raise NotImplementedError
 
@@ -117,23 +118,22 @@ def pso(x, y, info):
     func = generate_function(info["eval_type"], info["eval_model_type"], info["alpha"], info["dim"])
 
     # initialization
-    particles = init_particles_uniform_k(info["num_particles"], info["dim"])
-    # particles = pd.DataFrame(np.random.randint(0, 2, (info["num_particles"], info["dim"])))
+    positions = init_particles_uniform_k(info["num_particles"], info["dim"])
+    velocities = pd.DataFrame(np.random.uniform(-1, 1, (info["num_particles"], info["dim"])))
     scores = pd.DataFrame(np.zeros((info["num_particles"])))
     for i in range(info["num_particles"]):
-        scores.iloc[i] = func(x.iloc[:, (particles.iloc[i] == 1).values], y)
-    velocities = pd.DataFrame(np.random.uniform(-1, 1, (info["num_particles"], info["dim"])))
-    particles_best = particles.copy()
+        scores.iloc[i] = func(x.iloc[:, (positions.iloc[i] == 1).values], y)
+    particles_best = positions.copy()
     scores_best = scores.copy()
-    global_best_idx = scores_best.idxmax()
-    global_best = particles_best.iloc[global_best_idx].copy()
+    global_best_idx = scores_best.idxmin()
+    global_best_position = particles_best.iloc[global_best_idx].copy()
     global_best_score = scores_best.iloc[global_best_idx].copy()
 
     # PSO optimization
     for i in trange(info["num_iterations"], desc="PSO optimization", unit="Iters", leave=False):
 
         # position update
-        particles = (particles + velocities).clip(0,1).round().astype(int)
+        positions = (positions + velocities).clip(0,1).round().astype(int)
 
         # randomly rebooting
         if i % 40 == 0:
@@ -144,33 +144,32 @@ def pso(x, y, info):
             reboot_num = 0
             for j in reboot_idx:
                 if np.sum(velocities.iloc[j].values ** 2) < vel_eps:
-                    particles.iloc[j] = np.random.randint(0, 2, info["dim"])
+                    positions.iloc[j] = np.random.randint(0, 2, info["dim"])
                     velocities.iloc[j] = np.random.uniform(-1, 1, info["dim"])
                     reboot_num += 1
-            with no_handler(logger, "console"):
-                logger.debug(f"In iteration {i}, {reboot_num} particles rebooted.")
+            logger.debug(f"In iteration {i}, {reboot_num} particles rebooted.")
 
         # fitness scores update
         for i in range(info["num_particles"]):
-            scores.iloc[i] = func(x.iloc[:, (particles.iloc[i] == 1).values], y)
+            scores.iloc[i] = func(x.iloc[:, (positions.iloc[i] == 1).values], y)
 
         # position best update
         particles_best = pd.DataFrame(
-            np.where(scores_best < scores, particles_best, particles),
-            columns=particles.columns
+            np.where(scores_best < scores, particles_best, positions),
+            columns=positions.columns
         )
 
         # neighbor best selection
         for i in range(info["num_particles"]):
-            neighbors_idx = get_neighbourhood(info["topology_type"], particles, i, info["k"])
+            neighbors_idx = get_neighbourhood(info["topology_type"], positions, i, info["k"])
             neighbor_best_idx = scores.loc[neighbors_idx].idxmin()
-            neighbor_best = particles.iloc[neighbor_best_idx]
+            neighbor_best = positions.iloc[neighbor_best_idx]
 
         # velocity update
             velocities.iloc[i] = (
                 info["w"] * velocities.iloc[i] +
-                info["c1"] * random.uniform(0,1) * (particles_best.iloc[i] - particles.iloc[i]) +
-                info["c2"] * random.uniform(0,1) * (neighbor_best - particles.iloc[i])
+                info["c1"] * random.uniform(0,1) * (particles_best.iloc[i] - positions.iloc[i]) +
+                info["c2"] * random.uniform(0,1) * (neighbor_best - positions.iloc[i])
             )
 
         # best solution search
@@ -178,13 +177,13 @@ def pso(x, y, info):
         current_best_score = scores.iloc[current_best_idx]
         if current_best_score.values < global_best_score.values:
             global_best_score = current_best_score.copy()
-            global_best = particles.iloc[int(current_best_idx.iloc[0])]
+            global_best_position = positions.iloc[int(current_best_idx.iloc[0])]
         best_scores.append(global_best_score.values[0][0])
 
         # x generation
-    x_tr_pso = x.iloc[:, (global_best == 1).values]
+    x_tr_pso = x.iloc[:, (global_best_position == 1).values]
 
-    return x_tr_pso, global_best, best_scores
+    return x_tr_pso, global_best_position, best_scores
 
 def main(info):
     # random seed setting
@@ -201,6 +200,7 @@ def main(info):
     cv_scores = []
     cv_scores_pso = []
     all_best_scores = []
+    feature_counts = 0
     for fold, (x_tr, y_tr, x_val, y_val) in enumerate(k_fold_split(x, y, info["k_fold"], shuffle=info["shuffle"], random_seed=info["random_seed"])):
 
     # feature engineering
@@ -210,6 +210,7 @@ def main(info):
         result = ""
         for feature in global_best.values:
             result += str(feature)
+        feature_counts += sum(global_best.values)
         logger.info(f"Fold {fold+1} Global best: {sum(global_best.values)} features, {result}")
 
     # model creation
@@ -227,6 +228,7 @@ def main(info):
         cv_scores_pso.append(score_pso)
         logger.info(f"ORI Score: {score}, PSO Score: {score_pso}. Difference: {score_pso - score}.")
     logger.info(f"ORI Mean Score: {np.mean(cv_scores)}, PSO Mean Score: {np.mean(cv_scores_pso)}. Difference: {np.mean(cv_scores_pso) - np.mean(cv_scores)}.")
+    logger.info(f"Relative delta: {(np.mean(cv_scores_pso) - np.mean(cv_scores)) / np.mean(cv_scores) * 100} %. Feature reduction ratio: {(1 - feature_counts / (info['dim'] * info['k_fold'])) * 100} %.")
 
     # visualization
     plt.figure(figsize=(8, 5))
